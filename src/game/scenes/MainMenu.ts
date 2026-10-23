@@ -142,6 +142,13 @@ export class MainMenu extends Scene
         playButton.on('pointerout', () => playButton.setBackgroundColor('#ffd166'));
         playButton.once('pointerdown', () => this.startGame());
 
+        this.add.text(GAME_WIDTH / 2, 520, 'Pilih level di peta hutan', {
+            fontFamily: 'monospace',
+            fontSize: '17px',
+            fontStyle: 'bold',
+            color: '#a8d5ba'
+        }).setOrigin(0.5);
+
         this.add.text(
             GAME_WIDTH / 2,
             556,
@@ -159,8 +166,9 @@ export class MainMenu extends Scene
     private startGame ()
     {
         //  Klik PLAY adalah gesture yang membuka AudioContext untuk sesi game.
+        //  World Map menjadi pintu masuk ke level yang sudah terbuka.
         gameSfx.unlock();
         gameSfx.stopAll();
-        this.scene.start('Game');
+        this.scene.start('WorldMap');
     }
 }

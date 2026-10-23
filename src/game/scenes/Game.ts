@@ -1,13 +1,20 @@
 import { Input, Math as PhaserMath, Scene } from 'phaser';
 import { gameSfx } from '../audio/ProceduralSfx';
-import { createSoundToggle } from '../ui/SoundToggle';
+import { LEVELS, LevelDefinition, LevelFinish, LevelPlatform } from '../levels/LevelData';
+import {
+    LevelMissions,
+    countStars,
+    createEmptyMissions,
+    formatStars
+} from '../progress/StarRating';
+import { progressStore } from '../progress/ProgressStore';
+import { createSoundIcon, createSoundToggle, SoundIconHandle } from '../ui/SoundToggle';
+import { MobileControls, shouldShowVirtualControls } from '../ui/MobileControls';
 
 const GAME_WIDTH = 1024;
 const GAME_HEIGHT = 768;
 const MOVE_SPEED = 240;
 const JUMP_SPEED = 560;
-const START_X = 100;
-const START_Y = 688;
 const MAX_LIVES = 3;
 const PLAYER_FRAME_SIZE = 48;
 const PLAYER_BODY_WIDTH = 36;
@@ -23,12 +30,14 @@ const SLIME_BODY_HEIGHT = 22;
 const SLIME_BODY_OFFSET_X = 2;
 const SLIME_BODY_OFFSET_Y = 10;
 const SLIME_SPEED = 55;
-const SLIME_START_X = 300;
-const SLIME_START_Y = 582;
-const SLIME_PATROL_LEFT = 220;
-const SLIME_PATROL_RIGHT = 380;
 const STOMP_BOUNCE = 360;
 const ENEMY_INVULNERABILITY_MS = 900;
+const RESPAWN_INVULNERABILITY_MS = 1600;
+const RESPAWN_PIT_GRACE_MS = 500;
+const LIFE_LOSS_LOCK_MS = 150;
+const PLAYER_SAFE_MARGIN = 12;
+const CHECKPOINT_ZONE_WIDTH = 48;
+const CHECKPOINT_ZONE_HEIGHT = 72;
 
 const DEPTH_BACKGROUND = -100;
 const DEPTH_TERRAIN = -20;
@@ -44,15 +53,29 @@ const DEPTH_PAUSE_BACKDROP = 200;
 const DEPTH_PAUSE_PANEL = 201;
 const DEPTH_PAUSE_UI = 202;
 
-type GameState = 'playing' | 'paused' | 'gameover' | 'win';
+type GameState = 'playing' | 'paused' | 'levelcomplete' | 'victory' | 'gameover';
+
+type LifeLossReason = 'pit' | 'enemy';
+
+interface GameInitData
+{
+    levelIndex?: number;
+    score?: number;
+    lives?: number;
+}
+
+interface SafeStand
+{
+    x: number;
+    y: number;
+}
 
 export class Game extends Scene
 {
     private player: Phaser.Physics.Arcade.Sprite;
     private playerBody: Phaser.Physics.Arcade.Body;
-    private slime: Phaser.Physics.Arcade.Sprite;
-    private slimeBody: Phaser.Physics.Arcade.Body;
-    private slimeDirection = 1;
+    private platforms: Phaser.GameObjects.Rectangle[] = [];
+    private slimes: Phaser.Physics.Arcade.Sprite[] = [];
     private invulnerableUntil = 0;
     private wasOnGround = true;
     private landingDustSuppressedUntil = 0;
@@ -61,17 +84,57 @@ export class Game extends Scene
     private keyD: Phaser.Input.Keyboard.Key;
     private keyEsc: Phaser.Input.Keyboard.Key;
     private coins: Phaser.Physics.Arcade.StaticGroup;
-    private scoreText: Phaser.GameObjects.Text;
-    private livesText: Phaser.GameObjects.Text;
-    private muteText: Phaser.GameObjects.Text;
+    private coinText: Phaser.GameObjects.Text;
+    private livesIcons: Phaser.GameObjects.Image[] = [];
+    private soundIcon: SoundIconHandle | null = null;
+    private mobileControls: MobileControls | null = null;
+    private pitCheckSuppressedUntil = 0;
+    private lifeLossLockedUntil = 0;
     private pauseElements: Phaser.GameObjects.GameObject[] = [];
+    private checkpointFlags: Phaser.GameObjects.Rectangle[] = [];
+    private checkpointGlows: Phaser.GameObjects.Arc[] = [];
+    private checkpointLabels: Phaser.GameObjects.Text[] = [];
+    private activeCheckpointIndex: number | null = null;
+    private deathsThisAttempt = 0;
+    private enemiesDefeated = 0;
+    private resultMissions: LevelMissions = createEmptyMissions();
+    private finishHandled = false;
+    private levelIndex = 0;
+    private levelStartScore = 0;
+    private currentLevel: LevelDefinition = LEVELS[0];
     private score = 0;
     private lives = MAX_LIVES;
+    private coinsCollected = 0;
+    private resultStars = 0;
+    private bestStarsForLevel = 0;
+    private newBest = false;
     private gameState: GameState = 'playing';
 
     constructor ()
     {
         super('Game');
+    }
+
+    init (data: GameInitData = {})
+    {
+        //  Semua restart melewati init, sehingga level dan progres dapat
+        //  dipindahkan tanpa menyisakan state dari level sebelumnya.
+        const requestedLevel = data.levelIndex ?? 0;
+
+        this.levelIndex = PhaserMath.Clamp(
+            Math.floor(requestedLevel),
+            0,
+            LEVELS.length - 1
+        );
+        this.currentLevel = LEVELS[this.levelIndex];
+        this.score = Math.max(0, Math.floor(data.score ?? 0));
+
+        const requestedLives = typeof data.lives === 'number' && Number.isFinite(data.lives)
+            ? Math.floor(data.lives)
+            : MAX_LIVES;
+
+        this.lives = PhaserMath.Clamp(requestedLives, 1, MAX_LIVES);
+        this.levelStartScore = this.score;
     }
 
     preload ()
@@ -133,19 +196,46 @@ export class Game extends Scene
                 frameHeight: DECOR_FRAME_SIZE
             });
         }
+
+        if (!this.textures.exists('chicken-leg'))
+        {
+            this.load.spritesheet('chicken-leg', 'assets/chicken-leg.png', {
+                frameWidth: 24,
+                frameHeight: 24
+            });
+        }
     }
 
     create ()
     {
-        //  Scene restart memakai instance yang sama, jadi semua state harus direset di sini.
-        this.score = 0;
-        this.lives = MAX_LIVES;
+        //  Scene restart memakai instance yang sama, jadi semua state transient
+        //  harus direset. levelIndex, score, dan lives berasal dari init().
+        const level = this.currentLevel;
+
         this.gameState = 'playing';
-        this.slimeDirection = 1;
+        this.platforms = [];
+        this.slimes = [];
+        this.livesIcons = [];
+        this.checkpointFlags = [];
+        this.checkpointGlows = [];
+        this.checkpointLabels = [];
+        this.activeCheckpointIndex = null;
+        this.deathsThisAttempt = 0;
+        this.enemiesDefeated = 0;
+        this.resultMissions = createEmptyMissions();
+        this.finishHandled = false;
         this.invulnerableUntil = 0;
         this.wasOnGround = true;
         this.landingDustSuppressedUntil = 0;
+        this.pitCheckSuppressedUntil = 0;
+        this.lifeLossLockedUntil = 0;
+        this.soundIcon = null;
+        this.mobileControls = null;
         this.pauseElements = [];
+        this.coinsCollected = 0;
+        this.resultStars = 0;
+        this.bestStarsForLevel = progressStore.getBestStars(this.levelIndex);
+        this.newBest = false;
 
         //  Pastikan state global tidak tertinggal jika scene di-restart dari pause.
         this.physics.world.resume();
@@ -158,20 +248,13 @@ export class Game extends Scene
             .setDepth(DEPTH_BACKGROUND)
             .setScrollFactor(0);
 
-        //  Sisi kiri, kanan, dan atas tetap dibatasi. Sisi bawah sengaja dibuka
-        //  supaya karakter bisa jatuh melewati batas bawah game.
-        this.physics.world.setBounds(0, 0, GAME_WIDTH, GAME_HEIGHT, true, true, true, false);
+        //  Dunia mengikuti lebar data level, bukan lebar viewport. Camera juga
+        //  dibatasi ke area yang sama agar tidak memperlihatkan ruang kosong.
+        this.physics.world.setBounds(0, 0, level.width, GAME_HEIGHT, true, true, true, false);
+        this.cameras.main.setBounds(0, 0, level.width, GAME_HEIGHT);
 
-        //  Angka posisi dan ukuran ini sama dengan level sebelumnya.
         //  Rectangle tetap menjadi static body, lalu visual tanah digambar terpisah.
-        const platformDefinitions = [
-            { x: 150, y: 740, width: 300, height: 56 },
-            { x: 540, y: 740, width: 240, height: 56 },
-            { x: 902, y: 740, width: 244, height: 56 },
-            { x: 300, y: 610, width: 220, height: 24 },
-            { x: 600, y: 500, width: 220, height: 24 },
-            { x: 850, y: 390, width: 180, height: 24 }
-        ];
+        const platformDefinitions = level.platforms;
 
         const platforms = platformDefinitions.map((platform) => {
 
@@ -189,48 +272,52 @@ export class Game extends Scene
         });
 
         platforms.forEach((platform) => this.physics.add.existing(platform, true));
+        this.platforms = platforms;
+
         platformDefinitions.forEach((platform) => {
             this.createTerrain(platform.x, platform.y, platform.width, platform.height);
         });
 
-        //  Garis finis di ujung kanan level, memakai overlap agar bisa dilewati.
-        const finishLine = this.add.rectangle(GAME_WIDTH - 44, 646, 12, 132, 0xffd166);
-        finishLine.setStrokeStyle(3, 0x8a5a00);
-        finishLine.setDepth(DEPTH_FINISH);
+        //  Zona finis sekarang tidak terlihat; pemain masuk melalui mulut gua
+        //  yang digambar secara prosedural dari data finish.
+        const finish = level.finish;
+        const finishLine = this.add.rectangle(
+            finish.x,
+            finish.y,
+            Math.max(48, finish.width),
+            finish.height,
+            0x000000,
+            0
+        );
+        finishLine.setVisible(false);
         this.physics.add.existing(finishLine, true);
-
-        this.add.text(GAME_WIDTH - 44, 552, 'FINISH', {
-            fontFamily: 'monospace',
-            fontSize: '18px',
-            fontStyle: 'bold',
-            color: '#1f3d2b'
-        }).setOrigin(0.5).setDepth(DEPTH_FINISH + 1);
+        this.createCave(finish);
+        this.createStartArea();
 
         //  Karakter pixel art memakai dynamic body yang sama dengan placeholder lama.
-        this.player = this.physics.add.sprite(START_X, START_Y, 'player');
+        this.player = this.physics.add.sprite(level.spawn.x, level.spawn.y, 'player');
         this.playerBody = this.player.body as Phaser.Physics.Arcade.Body;
         this.playerBody.setSize(PLAYER_BODY_WIDTH, PLAYER_BODY_HEIGHT, false);
         this.playerBody.setOffset(PLAYER_BODY_OFFSET_X, 0);
         this.playerBody.setCollideWorldBounds(true);
         this.player.setDepth(DEPTH_PLAYER);
 
+        //  Kamera mengikuti player secara horizontal. world height sama dengan
+        //  viewport, jadi gerakan vertikal tetap terlihat tanpa scroll vertikal.
+        this.cameras.main.startFollow(this.player, true, 0.12, 0.12);
+
         this.createPlayerAnimations();
         this.player.anims.play('player-idle');
 
         this.physics.add.collider(this.player, platforms);
         this.physics.add.overlap(this.player, finishLine, this.reachFinish, undefined, this);
+        this.createCheckpoints();
 
         //  Koin memakai static body agar diam di tempat dan tidak terkena gravitasi.
         this.coins = this.physics.add.staticGroup();
         this.createCoinAnimations();
 
-        const coinPositions = [
-            { x: 260, y: 555 }, { x: 340, y: 555 },
-            { x: 560, y: 445 }, { x: 640, y: 445 },
-            { x: 810, y: 335 }, { x: 890, y: 335 }
-        ];
-
-        coinPositions.forEach((position) => {
+        level.coins.forEach((position) => {
 
             //  Sprite 24x24 dengan body 22x22, sesuai ukuran koin lama.
             const coin = this.add.sprite(position.x, position.y, 'coin');
@@ -247,12 +334,10 @@ export class Game extends Scene
         //  Overlap hanya mendeteksi sentuhan; karakter tidak terhalang oleh koin.
         this.physics.add.overlap(this.player, this.coins, this.collectCoin, undefined, this);
 
-        //  Slime berpatroli di Platform A. Batas patroli berada di dalam
-        //  platform (190..410), jadi slime tidak bisa berjalan keluar tepi.
         this.createSlimeAnimations();
-        this.createSlime(platforms);
+        this.createSlimes(platforms);
 
-        this.createDecorations();
+        this.createDecorations(platformDefinitions);
 
         this.cursors = this.input.keyboard!.createCursorKeys();
         this.keyA = this.input.keyboard!.addKey(Input.Keyboard.KeyCodes.A);
@@ -262,27 +347,88 @@ export class Game extends Scene
 
         this.setupAudio();
 
-        this.scoreText = this.add.text(24, 20, 'Skor: 0', {
+        this.createHud(level);
+        this.setupResponsiveControls();
+
+        if (import.meta.env.DEV)
+        {
+            (window as typeof window & { __game?: Game }).__game = this;
+        }
+    }
+
+    private createHud (level: LevelDefinition)
+    {
+        const coinIcon = this.add.sprite(42, 38, 'coin', 0)
+            .setDisplaySize(30, 30)
+            .setDepth(DEPTH_HUD)
+            .setScrollFactor(0);
+
+        coinIcon.play('coin-spin');
+
+        this.coinText = this.add.text(64, 23, `${this.coinsCollected}`, {
             fontFamily: 'monospace',
-            fontSize: '24px',
+            fontSize: '28px',
             fontStyle: 'bold',
-            color: '#1f3d2b'
-        }).setDepth(DEPTH_HUD);
+            color: '#1f3d2b',
+            stroke: '#f2e8cc',
+            strokeThickness: 4
+        }).setDepth(DEPTH_HUD).setScrollFactor(0);
 
-        this.livesText = this.add.text(24, 54, `Nyawa: ${this.lives}`, {
-            fontFamily: 'monospace',
-            fontSize: '20px',
-            fontStyle: 'bold',
-            color: '#1f3d2b'
-        }).setDepth(DEPTH_HUD);
+        this.createLivesHud();
 
-        this.add.text(24, 86, 'A / D atau Panah Kiri/Kanan: bergerak    Space: lompat    Esc: pause', {
-            fontFamily: 'monospace',
-            fontSize: '16px',
-            color: '#1f3d2b'
-        }).setDepth(DEPTH_HUD);
+        this.add.text(
+            GAME_WIDTH / 2,
+            16,
+            `Level ${this.levelIndex + 1}/${LEVELS.length} — ${level.name}`,
+            {
+                fontFamily: 'monospace',
+                fontSize: '20px',
+                fontStyle: 'bold',
+                color: '#1f3d2b',
+                backgroundColor: '#f2e8cc',
+                padding: { x: 12, y: 4 }
+            }
+        ).setOrigin(0.5, 0).setDepth(DEPTH_HUD).setScrollFactor(0);
 
-        this.muteText = createSoundToggle(this, GAME_WIDTH - 24, 20, DEPTH_HUD + 1);
+        //  Ikon speaker menggantikan tombol teks SFX dan tetap memakai
+        //  state audio global yang sama dengan menu lain.
+        this.soundIcon = createSoundIcon(this, GAME_WIDTH - 52, 42, DEPTH_HUD + 1);
+    }
+
+    private setupResponsiveControls ()
+    {
+        this.syncMobileControls();
+
+        this.scale.on('resize', this.handleScaleResize, this);
+        this.events.once('shutdown', () => {
+            this.scale.off('resize', this.handleScaleResize, this);
+            this.mobileControls?.resetInput();
+            this.mobileControls = null;
+        });
+    }
+
+    private handleScaleResize = () =>
+    {
+        this.syncMobileControls();
+    };
+
+    private syncMobileControls ()
+    {
+        if (shouldShowVirtualControls(this))
+        {
+            if (!this.mobileControls)
+            {
+                this.mobileControls = new MobileControls(this, DEPTH_HUD);
+            }
+
+            return;
+        }
+
+        if (this.mobileControls)
+        {
+            this.mobileControls.destroy();
+            this.mobileControls = null;
+        }
     }
 
     private setupAudio ()
@@ -309,6 +455,7 @@ export class Game extends Scene
 
         this.gameState = 'paused';
         this.playerBody.setVelocityX(0);
+        this.mobileControls?.resetInput();
         this.input.keyboard!.resetKeys();
         this.physics.world.pause();
         this.anims.pauseAll();
@@ -331,7 +478,8 @@ export class Game extends Scene
         this.tweens.resumeAll();
         this.input.keyboard!.resetKeys();
         this.playerBody.setVelocityX(0);
-        this.muteText.setText(gameSfx.isMuted() ? 'SFX: OFF' : 'SFX: ON');
+        this.mobileControls?.resetInput();
+        this.soundIcon?.refresh();
     }
 
     private showPauseOverlay ()
@@ -348,7 +496,7 @@ export class Game extends Scene
             GAME_HEIGHT,
             0x102018,
             0.78
-        ).setDepth(DEPTH_PAUSE_BACKDROP).setInteractive();
+        ).setDepth(DEPTH_PAUSE_BACKDROP).setScrollFactor(0).setInteractive();
 
         const panel = this.add.rectangle(
             GAME_WIDTH / 2,
@@ -357,7 +505,7 @@ export class Game extends Scene
             450,
             0x1f3d2b,
             0.96
-        ).setStrokeStyle(4, 0xffd166).setDepth(DEPTH_PAUSE_PANEL);
+        ).setStrokeStyle(4, 0xffd166).setDepth(DEPTH_PAUSE_PANEL).setScrollFactor(0);
 
         const title = this.add.text(GAME_WIDTH / 2, 232, 'PAUSED', {
             fontFamily: 'monospace',
@@ -366,13 +514,13 @@ export class Game extends Scene
             color: '#ffd166',
             stroke: '#102018',
             strokeThickness: 8
-        }).setOrigin(0.5).setDepth(DEPTH_PAUSE_UI);
+        }).setOrigin(0.5).setDepth(DEPTH_PAUSE_UI).setScrollFactor(0);
 
         const subtitle = this.add.text(GAME_WIDTH / 2, 282, 'Game dihentikan sementara', {
             fontFamily: 'monospace',
             fontSize: '18px',
             color: '#f2e8cc'
-        }).setOrigin(0.5).setDepth(DEPTH_PAUSE_UI);
+        }).setOrigin(0.5).setDepth(DEPTH_PAUSE_UI).setScrollFactor(0);
 
         const resumeButton = this.createMenuButton(
             GAME_WIDTH / 2,
@@ -408,7 +556,9 @@ export class Game extends Scene
             fontFamily: 'monospace',
             fontSize: '14px',
             color: '#a8d5ba'
-        }).setOrigin(0.5).setDepth(DEPTH_PAUSE_UI);
+        }).setOrigin(0.5).setDepth(DEPTH_PAUSE_UI).setScrollFactor(0);
+
+        soundToggle.setScrollFactor(0);
 
         this.pauseElements.push(
             backdrop,
@@ -449,7 +599,7 @@ export class Game extends Scene
             color: '#102018',
             backgroundColor: '#ffd166',
             padding: { x: 26, y: 10 }
-        }).setOrigin(0.5).setDepth(depth).setInteractive({ useHandCursor: true });
+        }).setOrigin(0.5).setDepth(depth).setScrollFactor(0).setInteractive({ useHandCursor: true });
 
         button.on('pointerover', () => button.setBackgroundColor('#fff0a8'));
         button.on('pointerout', () => button.setBackgroundColor('#ffd166'));
@@ -471,7 +621,58 @@ export class Game extends Scene
     {
         this.cleanupPauseForExit();
         gameSfx.stopAll();
-        this.scene.restart();
+
+        //  Restart mengulang level aktif. Skor kembali ke awal level agar coin
+        //  yang sudah diambil tidak bisa di-farm dengan restart berulang.
+        this.scene.restart({
+            levelIndex: this.levelIndex,
+            score: this.levelStartScore,
+            lives: MAX_LIVES
+        });
+    }
+
+    private nextLevel ()
+    {
+        if (this.gameState !== 'levelcomplete')
+        {
+            return;
+        }
+
+        const nextIndex = this.levelIndex + 1;
+
+        if (nextIndex >= LEVELS.length)
+        {
+            this.gameState = 'victory';
+            this.showFinalVictory();
+            return;
+        }
+
+        //  completeLevel() sudah membuka level berikutnya. Guard ini menjaga
+        //  agar tombol Continue tidak bisa melewati progres yang belum terbuka.
+        if (!progressStore.isUnlocked(nextIndex))
+        {
+            this.goToWorldMap();
+            return;
+        }
+
+        this.cleanupPauseForExit();
+        gameSfx.stopAll();
+        this.scene.restart({
+            levelIndex: nextIndex,
+            score: this.score,
+            lives: MAX_LIVES
+        });
+    }
+
+    private startNewRun ()
+    {
+        this.cleanupPauseForExit();
+        gameSfx.stopAll();
+        this.scene.restart({
+            levelIndex: 0,
+            score: 0,
+            lives: MAX_LIVES
+        });
     }
 
     private goToMainMenu ()
@@ -479,6 +680,13 @@ export class Game extends Scene
         this.cleanupPauseForExit();
         gameSfx.stopAll();
         this.scene.start('MainMenu');
+    }
+
+    private goToWorldMap ()
+    {
+        this.cleanupPauseForExit();
+        gameSfx.stopAll();
+        this.scene.start('WorldMap');
     }
 
     private spawnLandingDust ()
@@ -607,49 +815,253 @@ export class Game extends Scene
             .setFlipX(flipX);
     }
 
-    private createDecorations ()
+    private createDecorations (platforms: LevelPlatform[])
     {
-        //  Area tanah kiri.
-        this.addDecoration(42, 712, 0);
-        this.addDecoration(78, 712, 7, true);
-        this.addDecoration(138, 712, 1);
-        this.addDecoration(214, 712, 6, true);
-        this.addDecoration(282, 712, 3);
+        const groundFrames = [0, 7, 1, 6, 3, 4, 2, 5];
+        const platformFrames = [7, 3, 2, 6, 1];
 
-        //  Area tanah tengah.
-        this.addDecoration(438, 712, 4);
-        this.addDecoration(505, 712, 2);
-        this.addDecoration(575, 712, 7, true);
-        this.addDecoration(638, 712, 5);
+        platforms.forEach((platform, platformIndex) => {
+            const top = platform.y - platform.height / 2;
+            const left = platform.x - platform.width / 2;
+            const right = platform.x + platform.width / 2;
 
-        //  Area tanah kanan.
-        this.addDecoration(796, 712, 6);
-        this.addDecoration(862, 712, 1, true);
-        this.addDecoration(932, 712, 7);
-        this.addDecoration(1008, 712, 0, true);
+            if (platform.height > 32)
+            {
+                const count = platform.width >= 260 ? 4 : 3;
 
-        //  Platform A.
-        this.addDecoration(205, 598, 7);
-        this.addDecoration(300, 598, 3);
-        this.addDecoration(388, 598, 2);
+                for (let i = 0; i < count; i++)
+                {
+                    const x = left + 30 + ((platform.width - 60) * i) / Math.max(1, count - 1);
+                    const frame = groundFrames[(platformIndex + i) % groundFrames.length];
 
-        //  Platform B.
-        this.addDecoration(506, 488, 6, true);
-        this.addDecoration(598, 488, 7);
-        this.addDecoration(694, 488, 1);
+                    this.addDecoration(Math.round(x), top, frame, i % 2 === 1);
+                }
 
-        //  Platform C.
-        this.addDecoration(772, 378, 7, true);
-        this.addDecoration(848, 378, 3);
-        this.addDecoration(922, 378, 2);
+                return;
+            }
 
-        //  Sulur yang menggantung di bawah platform, tanpa physics.
-        this.addHangingDecoration(203, 622, 9);
-        this.addHangingDecoration(397, 622, 9);
-        this.addHangingDecoration(502, 512, 9);
-        this.addHangingDecoration(698, 512, 9, true);
-        this.addHangingDecoration(772, 402, 9);
-        this.addHangingDecoration(928, 402, 9, true);
+            //  Platform kecil mendapat dua tanaman di atas dan sulur di bawah.
+            this.addDecoration(
+                Math.round(left + platform.width * 0.28),
+                top,
+                platformFrames[platformIndex % platformFrames.length]
+            );
+            this.addDecoration(
+                Math.round(right - platform.width * 0.28),
+                top,
+                platformFrames[(platformIndex + 2) % platformFrames.length],
+                true
+            );
+
+            this.addHangingDecoration(Math.round(left + 8), top + 24, 9);
+            this.addHangingDecoration(Math.round(right - 8), top + 24, 9, true);
+        });
+    }
+
+    private createStartArea ()
+    {
+        const spawn = this.currentLevel.spawn;
+        const platform = this.findSupportingPlatform(spawn.x, spawn.y);
+        const top = platform
+            ? platform.y - platform.height / 2
+            : spawn.y + PLAYER_BODY_HEIGHT / 2;
+
+        //  Semak dan papan sederhana menandai titik awal tanpa aset eksternal.
+        this.add.image(spawn.x - 52, top, 'forest-decor', 0)
+            .setOrigin(0.5, 1)
+            .setScale(1.15)
+            .setDepth(DEPTH_DECOR + 1);
+        this.add.image(spawn.x + 52, top, 'forest-decor', 6)
+            .setOrigin(0.5, 1)
+            .setScale(1.2)
+            .setFlipX(true)
+            .setDepth(DEPTH_DECOR + 1);
+
+        this.add.rectangle(spawn.x, top, 4, 44, 0x4a2d18)
+            .setOrigin(0.5, 1)
+            .setDepth(DEPTH_DECOR + 2);
+        this.add.rectangle(spawn.x, top - 58, 76, 26, 0x8a5a2b)
+            .setStrokeStyle(2, 0x3a1d0e)
+            .setDepth(DEPTH_DECOR + 2);
+        this.add.text(spawn.x, top - 58, 'START', {
+            fontFamily: 'monospace',
+            fontSize: '14px',
+            fontStyle: 'bold',
+            color: '#f6d08a'
+        }).setOrigin(0.5).setDepth(DEPTH_DECOR + 3);
+    }
+
+    private createCheckpoints ()
+    {
+        this.currentLevel.checkpoints.forEach((checkpoint, index) => {
+            const platform = this.findSupportingPlatform(checkpoint.x, checkpoint.y);
+            const top = platform
+                ? platform.y - platform.height / 2
+                : checkpoint.y + PLAYER_BODY_HEIGHT / 2;
+
+            const pole = this.add.rectangle(checkpoint.x, top, 4, 38, 0x4a2d18)
+                .setOrigin(0.5, 1)
+                .setDepth(DEPTH_DECOR + 1);
+            pole.setData('checkpointIndex', index);
+
+            const flag = this.add.rectangle(
+                checkpoint.x + 10,
+                top - 34,
+                24,
+                14,
+                0x8a9a90
+            ).setOrigin(0, 0.5).setDepth(DEPTH_DECOR + 2);
+
+            const glow = this.add.circle(
+                checkpoint.x,
+                top - 28,
+                15,
+                0xffd166,
+                0
+            ).setDepth(DEPTH_DECOR);
+
+            const label = this.add.text(checkpoint.x, top - 58, 'CHECKPOINT', {
+                fontFamily: 'monospace',
+                fontSize: '11px',
+                fontStyle: 'bold',
+                color: '#a8d5ba'
+            }).setOrigin(0.5).setDepth(DEPTH_DECOR + 2);
+
+            this.checkpointFlags.push(flag);
+            this.checkpointGlows.push(glow);
+            this.checkpointLabels.push(label);
+
+            const zone = this.add.rectangle(
+                checkpoint.x,
+                checkpoint.y,
+                CHECKPOINT_ZONE_WIDTH,
+                CHECKPOINT_ZONE_HEIGHT,
+                0x000000,
+                0
+            );
+            zone.setVisible(false);
+            this.physics.add.existing(zone, true);
+            this.physics.add.overlap(
+                this.player,
+                zone,
+                () => this.activateCheckpoint(index),
+                undefined,
+                this
+            );
+        });
+    }
+
+    private activateCheckpoint (index: number)
+    {
+        if (this.gameState !== 'playing' || this.finishHandled)
+        {
+            return;
+        }
+
+        if (this.activeCheckpointIndex === index)
+        {
+            return;
+        }
+
+        this.activeCheckpointIndex = index;
+        this.updateCheckpointVisuals();
+        gameSfx.playCoin();
+
+        const notice = this.add.text(
+            GAME_WIDTH / 2,
+            128,
+            'CHECKPOINT AKTIF',
+            {
+                fontFamily: 'monospace',
+                fontSize: '22px',
+                fontStyle: 'bold',
+                color: '#ffd166',
+                stroke: '#102018',
+                strokeThickness: 5
+            }
+        ).setOrigin(0.5).setDepth(DEPTH_HUD + 1).setScrollFactor(0);
+
+        this.tweens.add({
+            targets: notice,
+            y: 108,
+            alpha: 0,
+            duration: 950,
+            ease: 'Quad.easeOut',
+            onComplete: () => notice.destroy()
+        });
+    }
+
+    private updateCheckpointVisuals ()
+    {
+        this.checkpointFlags.forEach((flag, index) => {
+            const active = index === this.activeCheckpointIndex;
+
+            flag.setFillStyle(active ? 0xffd166 : 0x8a9a90);
+            this.checkpointGlows[index]?.setAlpha(active ? 0.25 : 0);
+            this.checkpointLabels[index]
+                ?.setText(active ? 'CHECKPOINT OK' : 'CHECKPOINT')
+                .setColor(active ? '#ffd166' : '#a8d5ba');
+        });
+    }
+
+    private createCave (finish: LevelFinish)
+    {
+        const base = finish.y + finish.height / 2;
+        const centerX = finish.x;
+        const rock = this.add.graphics().setDepth(DEPTH_FINISH - 2);
+
+        //  Gundukan batu dengan mulut gua gelap; pemain masuk dari kiri.
+        rock.fillStyle(0x263a30, 1);
+        rock.fillRect(centerX - 84, base - 136, 168, 136);
+        rock.fillStyle(0x395548, 1);
+        rock.fillRect(centerX - 72, base - 154, 144, 154);
+        rock.fillRect(centerX - 92, base - 70, 24, 70);
+        rock.fillRect(centerX + 68, base - 82, 28, 82);
+
+        rock.fillStyle(0x070d0a, 1);
+        rock.fillRect(centerX - 42, base - 102, 84, 102);
+        rock.fillCircle(centerX, base - 102, 42);
+
+        rock.fillStyle(0x58705f, 1);
+        rock.fillRect(centerX - 58, base - 118, 16, 118);
+        rock.fillRect(centerX + 42, base - 126, 18, 126);
+        rock.fillRect(centerX - 42, base - 148, 84, 16);
+        rock.fillStyle(0x6f8a6c, 1);
+        rock.fillRect(centerX - 70, base - 118, 14, 10);
+        rock.fillRect(centerX + 30, base - 76, 18, 8);
+
+        this.add.text(centerX, base - 178, 'CAVE', {
+            fontFamily: 'monospace',
+            fontSize: '18px',
+            fontStyle: 'bold',
+            color: '#f2e8cc',
+            stroke: '#102018',
+            strokeThickness: 5
+        }).setOrigin(0.5).setDepth(DEPTH_FINISH + 1);
+    }
+
+    private createLivesHud ()
+    {
+        this.livesIcons = [];
+
+        for (let index = 0; index < MAX_LIVES; index++)
+        {
+            const icon = this.add.image(42 + index * 31, 80, 'chicken-leg', 0)
+                .setDisplaySize(28, 28)
+                .setDepth(DEPTH_HUD)
+                .setScrollFactor(0);
+
+            this.livesIcons.push(icon);
+        }
+
+        this.updateLivesHud();
+    }
+
+    private updateLivesHud ()
+    {
+        this.livesIcons.forEach((icon, index) => {
+            icon.setFrame(index < this.lives ? 0 : 1);
+        });
     }
 
     private createCoinAnimations ()
@@ -712,39 +1124,56 @@ export class Game extends Scene
         }
     }
 
-    private createSlime (platforms: Phaser.GameObjects.Rectangle[])
+    private createSlimes (platforms: Phaser.GameObjects.Rectangle[])
     {
-        this.slime = this.physics.add.sprite(SLIME_START_X, SLIME_START_Y, 'slime');
-        this.slimeBody = this.slime.body as Phaser.Physics.Arcade.Body;
-        this.slimeBody.setSize(SLIME_BODY_WIDTH, SLIME_BODY_HEIGHT, false);
-        this.slimeBody.setOffset(SLIME_BODY_OFFSET_X, SLIME_BODY_OFFSET_Y);
-        this.slimeBody.setVelocityX(SLIME_SPEED);
-        this.slime.setDepth(DEPTH_ENEMY);
-        this.slime.anims.play('slime-walk');
+        this.currentLevel.enemies.forEach((enemy) => {
+            const slime = this.physics.add.sprite(enemy.x, enemy.y, 'slime');
+            const slimeBody = slime.body as Phaser.Physics.Arcade.Body;
+            const speed = enemy.speed ?? SLIME_SPEED;
+            const direction = enemy.direction ?? 1;
 
-        //  Collider hanya dengan platform; slime tidak memakai jalur fisika player.
-        this.physics.add.collider(this.slime, platforms);
-        this.physics.add.overlap(this.player, this.slime, this.handleEnemyCollision, undefined, this);
+            slimeBody.setSize(SLIME_BODY_WIDTH, SLIME_BODY_HEIGHT, false);
+            slimeBody.setOffset(SLIME_BODY_OFFSET_X, SLIME_BODY_OFFSET_Y);
+            slimeBody.setVelocityX(speed * direction);
+            slime.setDepth(DEPTH_ENEMY);
+            slime.anims.play('slime-walk');
+
+            //  Data patroli disimpan per-slime agar level bisa punya beberapa musuh.
+            slime.setData('patrolLeft', enemy.patrolLeft);
+            slime.setData('patrolRight', enemy.patrolRight);
+            slime.setData('speed', speed);
+            slime.setData('direction', direction);
+
+            this.physics.add.collider(slime, platforms);
+            this.physics.add.overlap(this.player, slime, this.handleEnemyCollision, undefined, this);
+            this.slimes.push(slime);
+        });
     }
 
-    private updateSlime ()
+    private updateSlimes ()
     {
-        if (!this.slime.active)
-        {
-            return;
-        }
+        this.slimes.forEach((slime) => {
+            if (!slime.active)
+            {
+                return;
+            }
 
-        //  Balik arah sebelum menyentuh tepi area patroli.
-        if (this.slime.x <= SLIME_PATROL_LEFT)
-        {
-            this.slimeDirection = 1;
-        }
-        else if (this.slime.x >= SLIME_PATROL_RIGHT)
-        {
-            this.slimeDirection = -1;
-        }
+            const slimeBody = slime.body as Phaser.Physics.Arcade.Body;
+            let direction = slime.getData('direction') as number;
 
-        this.slimeBody.setVelocityX(SLIME_SPEED * this.slimeDirection);
+            //  Balik arah sebelum menyentuh tepi area patroli.
+            if (slime.x <= (slime.getData('patrolLeft') as number))
+            {
+                direction = 1;
+            }
+            else if (slime.x >= (slime.getData('patrolRight') as number))
+            {
+                direction = -1;
+            }
+
+            slime.setData('direction', direction);
+            slimeBody.setVelocityX((slime.getData('speed') as number) * direction);
+        });
     }
 
     private collectCoin: Phaser.Types.Physics.Arcade.ArcadePhysicsCallback = (_player, coin) =>
@@ -770,7 +1199,8 @@ export class Game extends Scene
         gameSfx.playCoin();
 
         this.score += 1;
-        this.scoreText.setText(`Skor: ${this.score}`);
+        this.coinsCollected += 1;
+        this.coinText.setText(`${this.coinsCollected}`);
     };
 
     private handleEnemyCollision: Phaser.Types.Physics.Arcade.ArcadePhysicsCallback = (_player, enemy) =>
@@ -798,6 +1228,10 @@ export class Game extends Scene
         if (stompedFromAbove)
         {
             slime.destroy();
+            this.enemiesDefeated = Math.min(
+                this.currentLevel.enemies.length,
+                this.enemiesDefeated + 1
+            );
             this.playerBody.setVelocityY(-STOMP_BOUNCE);
             gameSfx.playEnemyDefeat();
             return;
@@ -832,53 +1266,204 @@ export class Game extends Scene
             }
         });
 
-        this.loseLife();
+        this.loseLife('enemy');
     }
 
-    private respawnPlayer ()
+    private findSupportingPlatform (
+        x: number,
+        playerCenterY: number
+    ): Phaser.GameObjects.Rectangle | null
     {
+        const targetBottom = playerCenterY + PLAYER_BODY_HEIGHT / 2;
+
+        for (const platform of this.platforms)
+        {
+            const left = platform.x - platform.width / 2;
+            const right = platform.x + platform.width / 2;
+            const top = platform.y - platform.height / 2;
+
+            if (
+                x >= left
+                && x <= right
+                && Math.abs(targetBottom - top) <= 4
+            )
+            {
+                return platform;
+            }
+        }
+
+        return null;
+    }
+
+    private createSafeStand (
+        platform: Phaser.GameObjects.Rectangle,
+        preferredX: number
+    ): SafeStand
+    {
+        const left = platform.x - platform.width / 2;
+        const right = platform.x + platform.width / 2;
+        const top = platform.y - platform.height / 2;
+        const inset = PLAYER_BODY_WIDTH / 2 + PLAYER_SAFE_MARGIN;
+        const minX = left + inset;
+        const maxX = right - inset;
+        const safeX = minX <= maxX
+            ? PhaserMath.Clamp(preferredX, minX, maxX)
+            : platform.x;
+
+        return {
+            x: safeX,
+            //  Satu piksel di atas permukaan platform agar body tidak tertanam.
+            y: top - PLAYER_BODY_HEIGHT / 2 - 1
+        };
+    }
+
+    private getCheckpointRespawnPoint (): SafeStand
+    {
+        if (this.activeCheckpointIndex !== null)
+        {
+            const checkpoint = this.currentLevel.checkpoints[this.activeCheckpointIndex];
+
+            if (checkpoint)
+            {
+                const platform = this.findSupportingPlatform(checkpoint.x, checkpoint.y);
+
+                if (platform)
+                {
+                    return this.createSafeStand(platform, checkpoint.x);
+                }
+            }
+        }
+
+        const spawn = this.currentLevel.spawn;
+        const spawnPlatform = this.findSupportingPlatform(spawn.x, spawn.y);
+
+        if (spawnPlatform)
+        {
+            //  Spawn awal berada di dekat semak-semak pada platform kiri.
+            return this.createSafeStand(spawnPlatform, spawn.x);
+        }
+
+        return {
+            x: spawn.x,
+            y: spawn.y
+        };
+    }
+
+    private getPitRespawnPoint (): SafeStand
+    {
+        //  Jatuh ke pit selalu kembali ke checkpoint aktif. Spawn awal hanya
+        //  dipakai jika checkpoint belum pernah diaktifkan.
+        return this.getCheckpointRespawnPoint();
+    }
+
+    private respawnPlayer (reason: LifeLossReason)
+    {
+        const stand = reason === 'enemy'
+            ? this.getCheckpointRespawnPoint()
+            : this.getPitRespawnPoint();
+
         //  reset() mengembalikan posisi dan menghentikan velocity/acceleration.
-        this.playerBody.reset(START_X, START_Y);
+        this.playerBody.reset(stand.x, stand.y);
         this.playerBody.setVelocity(0, 0);
         this.playerBody.setAcceleration(0, 0);
+        this.playerBody.setAllowGravity(true);
 
         this.player.setFlipX(false);
+        this.player.setAlpha(1);
         this.player.anims.play('player-idle', true);
         this.wasOnGround = true;
         this.landingDustSuppressedUntil = this.time.now + 250;
+        //  Lindungi frame respawn dari pemeriksaan pit sebelum fisika stabil.
+        this.pitCheckSuppressedUntil = this.time.now + RESPAWN_PIT_GRACE_MS;
+
+        //  Setelah respawn jauh ke belakang, kamera langsung ikut agar
+        //  pemain tidak muncul di luar layar.
+        this.cameras.main.centerOn(stand.x, stand.y);
     }
 
     private reachFinish: Phaser.Types.Physics.Arcade.ArcadePhysicsCallback = () =>
     {
-        if (this.gameState !== 'playing')
+        if (this.gameState !== 'playing' || this.finishHandled)
         {
             return;
         }
 
-        this.gameState = 'win';
+        //  Tandai lebih dulu supaya overlap pada frame yang sama tidak
+        //  menyimpan hasil dan membuka level dua kali.
+        this.finishHandled = true;
+
+        const missions = this.evaluateMissions();
+
         this.stopPlayer();
+        this.physics.world.pause();
+        this.anims.pauseAll();
+        this.tweens.pauseAll();
+        this.input.keyboard!.resetKeys();
         gameSfx.playWin();
-        this.showEndScreen('YOU WIN!', '#1f6b3a', 'PLAY AGAIN');
+
+        const completion = progressStore.completeLevel(
+            this.levelIndex,
+            missions,
+            this.coinsCollected
+        );
+
+        this.resultMissions = missions;
+        this.resultStars = countStars(missions);
+        this.bestStarsForLevel = completion.bestStars;
+        this.newBest = completion.newBest;
+
+        if (this.levelIndex >= LEVELS.length - 1)
+        {
+            this.gameState = 'victory';
+            this.showFinalVictory();
+        }
+        else
+        {
+            this.gameState = 'levelcomplete';
+            this.showLevelComplete();
+        }
     };
 
-    private loseLife ()
+    private evaluateMissions (): LevelMissions
     {
-        if (this.gameState !== 'playing')
+        const totalCoins = this.currentLevel.coins.length;
+        const totalEnemies = this.currentLevel.enemies.length;
+
+        return {
+            allCoins: this.coinsCollected >= totalCoins,
+            noDeath: this.deathsThisAttempt === 0,
+            //  Level tanpa musuh otomatis memenuhi misi All Enemies.
+            allEnemies: this.enemiesDefeated >= totalEnemies
+        };
+    }
+
+    private loseLife (reason: LifeLossReason)
+    {
+        if (
+            this.gameState !== 'playing'
+            || this.finishHandled
+            || this.time.now < this.lifeLossLockedUntil
+        )
         {
             return;
         }
 
-        this.lives -= 1;
-        this.livesText.setText(`Nyawa: ${this.lives}`);
-
-        //  Langsung kembali ke titik awal, sehingga satu kali jatuh hanya
-        //  mengurangi satu nyawa dan tidak memicu pengecekan berkali-kali.
-        this.respawnPlayer();
+        this.lifeLossLockedUntil = this.time.now + LIFE_LOSS_LOCK_MS;
+        this.lives = Math.max(0, this.lives - 1);
+        this.deathsThisAttempt += 1;
+        this.updateLivesHud();
 
         if (this.lives <= 0)
         {
             this.endGame();
+            return;
         }
+
+        this.respawnPlayer(reason);
+        this.invulnerableUntil = Math.max(
+            this.invulnerableUntil,
+            this.time.now + RESPAWN_INVULNERABILITY_MS
+        );
     }
 
     private stopPlayer ()
@@ -889,11 +1474,15 @@ export class Game extends Scene
         this.playerBody.setAllowGravity(false);
 
         this.player.anims.play('player-idle', true);
+        this.mobileControls?.resetInput();
 
-        if (this.slime?.active)
-        {
-            this.slimeBody.setVelocityX(0);
-        }
+        this.slimes.forEach((slime) => {
+            if (slime.active)
+            {
+                const slimeBody = slime.body as Phaser.Physics.Arcade.Body;
+                slimeBody.setVelocityX(0);
+            }
+        });
     }
 
     private endGame ()
@@ -906,39 +1495,218 @@ export class Game extends Scene
 
     private showEndScreen (title: string, titleColor: string, buttonLabel: string)
     {
-        this.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, GAME_WIDTH, GAME_HEIGHT, 0x102018, 0.72)
-            .setDepth(90);
-
-        this.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, 700, 430, 0x102018, 0.55)
-            .setStrokeStyle(4, 0xffd166)
-            .setDepth(91);
-
-        this.add.text(GAME_WIDTH / 2, GAME_HEIGHT / 2 - 70, title, {
-            fontFamily: 'monospace',
-            fontSize: '72px',
-            fontStyle: 'bold',
-            color: titleColor,
-            stroke: '#ffffff',
-            strokeThickness: 8
-        }).setOrigin(0.5).setDepth(100);
+        this.createResultPanel(
+            title,
+            titleColor,
+            '#ffffff',
+            `Level ${this.levelIndex + 1}/${LEVELS.length} — ${this.currentLevel.name}`,
+            `Skor: ${this.score}`
+        );
 
         this.createMenuButton(
             GAME_WIDTH / 2 - 125,
-            GAME_HEIGHT / 2 + 80,
+            470,
             buttonLabel,
             () => this.restartGame(),
             101,
-            '26px'
+            '24px'
         );
 
         this.createMenuButton(
             GAME_WIDTH / 2 + 135,
-            GAME_HEIGHT / 2 + 80,
+            470,
             'MAIN MENU',
             () => this.goToMainMenu(),
             101,
-            '26px'
+            '24px'
         );
+    }
+
+    private showLevelComplete ()
+    {
+        const nextLevel = LEVELS[this.levelIndex + 1];
+
+        if (!nextLevel)
+        {
+            this.gameState = 'victory';
+            this.showFinalVictory();
+            return;
+        }
+
+        this.createResultPanel(
+            'LEVEL COMPLETE',
+            '#ffd166',
+            '#102018',
+            `Level ${this.levelIndex + 1}/${LEVELS.length} — ${this.currentLevel.name}`,
+            `Skor: ${this.score}`
+        );
+
+        this.addLevelResultDetails();
+
+        this.add.text(GAME_WIDTH / 2, 500, `Berikutnya: ${nextLevel.name}`, {
+            fontFamily: 'monospace',
+            fontSize: '18px',
+            color: '#f2e8cc'
+        }).setOrigin(0.5).setDepth(100).setScrollFactor(0);
+
+        this.createMenuButton(
+            GAME_WIDTH / 2 - 125,
+            556,
+            'NEXT LEVEL',
+            () => this.nextLevel(),
+            101,
+            '24px'
+        );
+
+        this.createMenuButton(
+            GAME_WIDTH / 2 + 135,
+            556,
+            'WORLD MAP',
+            () => this.goToWorldMap(),
+            101,
+            '24px'
+        );
+    }
+
+    private showFinalVictory ()
+    {
+        this.createResultPanel(
+            'FINAL VICTORY',
+            '#ffd166',
+            '#102018',
+            `Semua ${LEVELS.length} level selesai!`,
+            `Skor akhir: ${this.score}`
+        );
+
+        this.addLevelResultDetails();
+
+        this.createMenuButton(
+            GAME_WIDTH / 2 - 125,
+            556,
+            'PLAY AGAIN',
+            () => this.startNewRun(),
+            101,
+            '24px'
+        );
+
+        this.createMenuButton(
+            GAME_WIDTH / 2 + 135,
+            556,
+            'WORLD MAP',
+            () => this.goToWorldMap(),
+            101,
+            '24px'
+        );
+    }
+
+    private addLevelResultDetails ()
+    {
+        const totalCoins = this.currentLevel.coins.length;
+        const totalEnemies = this.currentLevel.enemies.length;
+        const bestStars = formatStars(this.bestStarsForLevel, 3);
+        const bestNote = this.newBest ? '  ·  REKOR BARU!' : '';
+
+        this.add.text(
+            GAME_WIDTH / 2,
+            390,
+            `Bintang: ${formatStars(this.resultStars, 3)}  ·  Terbaik: ${bestStars}${bestNote}`,
+            {
+                fontFamily: 'monospace',
+                fontSize: '20px',
+                fontStyle: 'bold',
+                color: '#ffd166',
+                align: 'center'
+            }
+        ).setOrigin(0.5).setDepth(100).setScrollFactor(0);
+
+        const missions = [
+            {
+                label: 'ALL COINS',
+                earned: this.resultMissions.allCoins,
+                detail: `${this.coinsCollected}/${totalCoins} coin`
+            },
+            {
+                label: 'NO DEATH',
+                earned: this.resultMissions.noDeath,
+                detail: this.resultMissions.noDeath
+                    ? 'tanpa kehilangan nyawa'
+                    : `gagal (${this.deathsThisAttempt}x kehilangan nyawa)`
+            },
+            {
+                label: 'ALL ENEMIES',
+                earned: this.resultMissions.allEnemies,
+                detail: totalEnemies === 0
+                    ? 'tidak ada musuh - otomatis'
+                    : `${this.enemiesDefeated}/${totalEnemies} musuh`
+            }
+        ];
+
+        missions.forEach((mission, index) => {
+            const y = 423 + index * 23;
+            const color = mission.earned ? '#ffd166' : '#8a9a90';
+
+            this.add.text(
+                GAME_WIDTH / 2 - 220,
+                y,
+                `${mission.earned ? '★' : '☆'} ${mission.label}`,
+                {
+                    fontFamily: 'monospace',
+                    fontSize: '17px',
+                    fontStyle: 'bold',
+                    color
+                }
+            ).setOrigin(0, 0.5).setDepth(100).setScrollFactor(0);
+
+            this.add.text(
+                GAME_WIDTH / 2 + 220,
+                y,
+                mission.detail,
+                {
+                    fontFamily: 'monospace',
+                    fontSize: '15px',
+                    color: mission.earned ? '#f2e8cc' : '#8a9a90'
+                }
+            ).setOrigin(1, 0.5).setDepth(100).setScrollFactor(0);
+        });
+    }
+
+    private createResultPanel (
+        title: string,
+        titleColor: string,
+        titleStroke: string,
+        subtitle: string,
+        scoreLabel: string
+    )
+    {
+        this.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, GAME_WIDTH, GAME_HEIGHT, 0x102018, 0.78)
+            .setDepth(90).setScrollFactor(0);
+
+        this.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, 720, 500, 0x102018, 0.58)
+            .setStrokeStyle(4, 0xffd166)
+            .setDepth(91).setScrollFactor(0);
+
+        this.add.text(GAME_WIDTH / 2, 235, title, {
+            fontFamily: 'monospace',
+            fontSize: '64px',
+            fontStyle: 'bold',
+            color: titleColor,
+            stroke: titleStroke,
+            strokeThickness: 8
+        }).setOrigin(0.5).setDepth(100).setScrollFactor(0);
+
+        this.add.text(GAME_WIDTH / 2, 312, subtitle, {
+            fontFamily: 'monospace',
+            fontSize: '20px',
+            color: '#f2e8cc',
+            align: 'center'
+        }).setOrigin(0.5).setDepth(100).setScrollFactor(0);
+
+        this.add.text(GAME_WIDTH / 2, 352, scoreLabel, {
+            fontFamily: 'monospace',
+            fontSize: '22px',
+            fontStyle: 'bold',
+            color: '#a8d5ba'
+        }).setOrigin(0.5).setDepth(100).setScrollFactor(0);
     }
 
     update ()
@@ -954,7 +1722,8 @@ export class Game extends Scene
             return;
         }
 
-        //  Saat Game Over atau You Win, update berhenti di sini sehingga input tidak diproses.
+        //  Saat result screen (Game Over / Level Complete / Final Victory),
+        //  update berhenti di sini sehingga input gameplay tidak diproses.
         if (this.gameState !== 'playing')
         {
             return;
@@ -966,13 +1735,16 @@ export class Game extends Scene
             return;
         }
 
-        if (this.playerBody.y > GAME_HEIGHT)
+        if (
+            this.time.now >= this.pitCheckSuppressedUntil
+            && this.playerBody.y > GAME_HEIGHT
+        )
         {
-            this.loseLife();
+            this.loseLife('pit');
             return;
         }
 
-        this.updateSlime();
+        this.updateSlimes();
 
         const onGround = this.playerBody.blocked.down;
 
@@ -982,8 +1754,12 @@ export class Game extends Scene
             this.spawnLandingDust();
         }
 
-        const movingLeft = this.cursors.left.isDown || this.keyA.isDown;
-        const movingRight = this.cursors.right.isDown || this.keyD.isDown;
+        const movingLeft = this.cursors.left.isDown
+            || this.keyA.isDown
+            || this.mobileControls?.leftPressed === true;
+        const movingRight = this.cursors.right.isDown
+            || this.keyD.isDown
+            || this.mobileControls?.rightPressed === true;
 
         if (movingLeft === movingRight)
         {
@@ -1002,8 +1778,9 @@ export class Game extends Scene
         }
 
         //  JustDown memastikan satu tekanan Space hanya menghasilkan satu lompatan.
-        //  blocked.down berarti karakter sedang menapak di tanah atau platform.
-        const jumped = Input.Keyboard.JustDown(this.cursors.space) && onGround;
+        //  Antrian tombol virtual dikonsumsi setiap frame agar tidak menumpuk.
+        const mobileJump = this.mobileControls?.consumeJump() ?? false;
+        const jumped = (Input.Keyboard.JustDown(this.cursors.space) || mobileJump) && onGround;
 
         if (jumped)
         {
